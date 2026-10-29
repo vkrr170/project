@@ -1,3 +1,15 @@
+// ── MUTABLE RESULT TRACKING ───────────────────────────────────────────────────
+// Declared outside the pipeline block so they are true Groovy script-level
+// variables. These are readable AND writable from both `script {}` steps and
+// `when { expression {} }` blocks — unlike `environment {}` variables which
+// are frozen after the environment block evaluates.
+def buildResult           = 'NOT_RUN'
+def unitTestResult        = 'NOT_RUN'
+def integrationTestResult = 'NOT_RUN'
+def stagingDeployResult   = 'NOT_RUN'
+def prodDeployResult      = 'NOT_RUN'
+def smokeTestResult       = 'NOT_RUN'
+
 pipeline {
     agent any
 
@@ -26,16 +38,8 @@ pipeline {
     }
 
     environment {
-        // Rolled-up results — initialised to NOT_RUN so conditions read cleanly
-        BUILD_RESULT           = 'NOT_RUN'
-        UNIT_TEST_RESULT       = 'NOT_RUN'
-        INTEGRATION_TEST_RESULT= 'NOT_RUN'
-        STAGING_DEPLOY_RESULT  = 'NOT_RUN'
-        PROD_DEPLOY_RESULT     = 'NOT_RUN'
-        SMOKE_TEST_RESULT      = 'NOT_RUN'
-
-        // Derived artifact ID — prefer the explicit param, fall back to build number
-        EFFECTIVE_ARTIFACT_ID  = "${params.ARTIFACT_ID?.trim() ? params.ARTIFACT_ID : env.BUILD_NUMBER}"
+        // Only static values here — derived artifact ID (read-only after set)
+        EFFECTIVE_ARTIFACT_ID = "${params.ARTIFACT_ID?.trim() ? params.ARTIFACT_ID : env.BUILD_NUMBER}"
     }
 
     stages {
@@ -52,10 +56,10 @@ pipeline {
                                        string(name: 'ARTIFACT_ID', value: env.EFFECTIVE_ARTIFACT_ID)
                                    ]
 
-                    env.BUILD_RESULT = run.result ?: 'SUCCESS'
-                    echo "Build result: ${env.BUILD_RESULT}"
+                    buildResult = run.result ?: 'SUCCESS'
+                    echo "Build result: ${buildResult}"
 
-                    if (env.BUILD_RESULT != 'SUCCESS') {
+                    if (buildResult != 'SUCCESS') {
                         currentBuild.result = 'FAILURE'
                         error("Build job failed — aborting pipeline.")
                     }
@@ -64,11 +68,9 @@ pipeline {
         }
 
         // ── 2. PARALLEL TESTS ─────────────────────────────────────────────────
-        // Runs unit and integration tests side-by-side.
-        // Both must pass before deployment is considered.
         stage('Tests') {
             when {
-                expression { return params.RUN_TESTS && env.BUILD_RESULT == 'SUCCESS' }
+                expression { return params.RUN_TESTS && buildResult == 'SUCCESS' }
             }
             parallel {
                 stage('Unit Tests') {
@@ -82,8 +84,8 @@ pipeline {
                                                string(name: 'ARTIFACT_ID', value: env.EFFECTIVE_ARTIFACT_ID)
                                            ]
 
-                            env.UNIT_TEST_RESULT = run.result ?: 'SUCCESS'
-                            echo "Unit-test result: ${env.UNIT_TEST_RESULT}"
+                            unitTestResult = run.result ?: 'SUCCESS'
+                            echo "Unit-test result: ${unitTestResult}"
                         }
                     }
                 }
@@ -99,23 +101,19 @@ pipeline {
                                                string(name: 'ARTIFACT_ID', value: env.EFFECTIVE_ARTIFACT_ID)
                                            ]
 
-                            env.INTEGRATION_TEST_RESULT = run.result ?: 'SUCCESS'
-                            echo "Integration-test result: ${env.INTEGRATION_TEST_RESULT}"
+                            integrationTestResult = run.result ?: 'SUCCESS'
+                            echo "Integration-test result: ${integrationTestResult}"
                         }
                     }
                 }
             }
 
-            // Evaluate combined test outcome after both parallel legs finish
             post {
                 always {
                     script {
-                        def unitOk        = env.UNIT_TEST_RESULT        == 'SUCCESS'
-                        def integrationOk = env.INTEGRATION_TEST_RESULT == 'SUCCESS'
-
-                        if (!unitOk || !integrationOk) {
+                        if (unitTestResult != 'SUCCESS' || integrationTestResult != 'SUCCESS') {
                             currentBuild.result = 'FAILURE'
-                            echo "One or more test jobs failed. Unit=${env.UNIT_TEST_RESULT}, Integration=${env.INTEGRATION_TEST_RESULT}"
+                            echo "One or more test jobs failed. Unit=${unitTestResult}, Integration=${integrationTestResult}"
                         }
                     }
                 }
@@ -123,13 +121,13 @@ pipeline {
         }
 
         // ── 3. STAGING DEPLOY ─────────────────────────────────────────────────
-        // Deploys to staging when build + both tests passed.
         stage('Deploy to Staging') {
             when {
                 expression {
                     return params.RUN_STAGING_DEPLOY &&
-                           env.BUILD_RESULT == 'SUCCESS' &&
-                           allTestsPassed()
+                           buildResult == 'SUCCESS' &&
+                           unitTestResult in ['SUCCESS', 'NOT_RUN'] &&
+                           integrationTestResult in ['SUCCESS', 'NOT_RUN']
                 }
             }
             steps {
@@ -139,15 +137,15 @@ pipeline {
                                    propagate: false,
                                    wait: true,
                                    parameters: [
-                                       string(name: 'ARTIFACT_ID',    value: env.EFFECTIVE_ARTIFACT_ID),
-                                       string(name: 'DEPLOY_REGION',  value: params.DEPLOY_REGION),
-                                       string(name: 'ENVIRONMENT',    value: 'staging')
+                                       string(name: 'ARTIFACT_ID',   value: env.EFFECTIVE_ARTIFACT_ID),
+                                       string(name: 'DEPLOY_REGION', value: params.DEPLOY_REGION),
+                                       string(name: 'ENVIRONMENT',   value: 'staging')
                                    ]
 
-                    env.STAGING_DEPLOY_RESULT = run.result ?: 'SUCCESS'
-                    echo "Staging deploy result: ${env.STAGING_DEPLOY_RESULT}"
+                    stagingDeployResult = run.result ?: 'SUCCESS'
+                    echo "Staging deploy result: ${stagingDeployResult}"
 
-                    if (env.STAGING_DEPLOY_RESULT != 'SUCCESS' && params.ENABLE_ROLLBACK) {
+                    if (stagingDeployResult != 'SUCCESS' && params.ENABLE_ROLLBACK) {
                         triggerRollback('staging')
                     }
                 }
@@ -159,7 +157,7 @@ pipeline {
             when {
                 expression {
                     return params.RUN_SMOKE_TESTS &&
-                           env.STAGING_DEPLOY_RESULT == 'SUCCESS'
+                           stagingDeployResult == 'SUCCESS'
                 }
             }
             steps {
@@ -173,10 +171,10 @@ pipeline {
                                        string(name: 'ENVIRONMENT', value: 'staging')
                                    ]
 
-                    env.SMOKE_TEST_RESULT = run.result ?: 'SUCCESS'
-                    echo "Smoke test result (staging): ${env.SMOKE_TEST_RESULT}"
+                    smokeTestResult = run.result ?: 'SUCCESS'
+                    echo "Smoke test result (staging): ${smokeTestResult}"
 
-                    if (env.SMOKE_TEST_RESULT != 'SUCCESS') {
+                    if (smokeTestResult != 'SUCCESS') {
                         currentBuild.result = 'UNSTABLE'
                         echo "Smoke tests failed on staging — production deploy will be blocked."
                     }
@@ -185,16 +183,13 @@ pipeline {
         }
 
         // ── 5. MANUAL GATE ────────────────────────────────────────────────────
-        // Human approval required before touching production.
-        // Only reached when: prod deploy is enabled, branch is correct,
-        // staging deployed and smoke tests passed.
         stage('Approve Production Deploy') {
             when {
                 expression {
                     return params.RUN_PROD_DEPLOY &&
                            env.BRANCH_NAME == params.TARGET_BRANCH &&
-                           env.STAGING_DEPLOY_RESULT == 'SUCCESS' &&
-                           env.SMOKE_TEST_RESULT == 'SUCCESS'
+                           stagingDeployResult == 'SUCCESS' &&
+                           smokeTestResult == 'SUCCESS'
                 }
             }
             steps {
@@ -209,13 +204,11 @@ pipeline {
         // ── 6. PRODUCTION DEPLOY ──────────────────────────────────────────────
         stage('Deploy to Production') {
             when {
-                // Re-check all guards here — the input step above may have been
-                // approved but conditions could have changed (e.g. concurrent run).
                 expression {
                     return params.RUN_PROD_DEPLOY &&
                            env.BRANCH_NAME == params.TARGET_BRANCH &&
-                           env.STAGING_DEPLOY_RESULT == 'SUCCESS' &&
-                           env.SMOKE_TEST_RESULT == 'SUCCESS' &&
+                           stagingDeployResult == 'SUCCESS' &&
+                           smokeTestResult == 'SUCCESS' &&
                            currentBuild.result in [null, 'SUCCESS']
                 }
             }
@@ -231,10 +224,10 @@ pipeline {
                                        string(name: 'ENVIRONMENT',   value: 'production')
                                    ]
 
-                    env.PROD_DEPLOY_RESULT = run.result ?: 'SUCCESS'
-                    echo "Production deploy result: ${env.PROD_DEPLOY_RESULT}"
+                    prodDeployResult = run.result ?: 'SUCCESS'
+                    echo "Production deploy result: ${prodDeployResult}"
 
-                    if (env.PROD_DEPLOY_RESULT != 'SUCCESS') {
+                    if (prodDeployResult != 'SUCCESS') {
                         currentBuild.result = 'FAILURE'
                         if (params.ENABLE_ROLLBACK) {
                             triggerRollback('production')
@@ -249,7 +242,7 @@ pipeline {
             when {
                 expression {
                     return params.RUN_SMOKE_TESTS &&
-                           env.PROD_DEPLOY_RESULT == 'SUCCESS'
+                           prodDeployResult == 'SUCCESS'
                 }
             }
             steps {
@@ -263,11 +256,10 @@ pipeline {
                                        string(name: 'ENVIRONMENT', value: 'production')
                                    ]
 
-                    // Reuse the same env var — last write wins (production)
-                    env.SMOKE_TEST_RESULT = run.result ?: 'SUCCESS'
-                    echo "Smoke test result (production): ${env.SMOKE_TEST_RESULT}"
+                    smokeTestResult = run.result ?: 'SUCCESS'
+                    echo "Smoke test result (production): ${smokeTestResult}"
 
-                    if (env.SMOKE_TEST_RESULT != 'SUCCESS') {
+                    if (smokeTestResult != 'SUCCESS') {
                         currentBuild.result = 'FAILURE'
                         if (params.ENABLE_ROLLBACK) {
                             triggerRollback('production')
@@ -282,23 +274,22 @@ pipeline {
     post {
         always {
             script {
-                // Notify regardless of outcome so teams always get a status update.
                 if (params.NOTIFY_JOB?.trim()) {
                     echo "==> Triggering notification job: ${params.NOTIFY_JOB}"
                     build job: params.NOTIFY_JOB,
                           propagate: false,
                           wait: false,
                           parameters: [
-                              string(name: 'PIPELINE_NAME',              value: env.JOB_NAME),
-                              string(name: 'PIPELINE_RESULT',            value: currentBuild.currentResult),
-                              string(name: 'ARTIFACT_ID',                value: env.EFFECTIVE_ARTIFACT_ID),
-                              string(name: 'BUILD_RESULT',               value: env.BUILD_RESULT),
-                              string(name: 'UNIT_TEST_RESULT',           value: env.UNIT_TEST_RESULT),
-                              string(name: 'INTEGRATION_TEST_RESULT',    value: env.INTEGRATION_TEST_RESULT),
-                              string(name: 'STAGING_DEPLOY_RESULT',      value: env.STAGING_DEPLOY_RESULT),
-                              string(name: 'PROD_DEPLOY_RESULT',         value: env.PROD_DEPLOY_RESULT),
-                              string(name: 'SMOKE_TEST_RESULT',          value: env.SMOKE_TEST_RESULT),
-                              string(name: 'BUILD_URL',                  value: env.BUILD_URL)
+                              string(name: 'PIPELINE_NAME',           value: env.JOB_NAME),
+                              string(name: 'PIPELINE_RESULT',         value: currentBuild.currentResult),
+                              string(name: 'ARTIFACT_ID',             value: env.EFFECTIVE_ARTIFACT_ID),
+                              string(name: 'BUILD_RESULT',            value: buildResult),
+                              string(name: 'UNIT_TEST_RESULT',        value: unitTestResult),
+                              string(name: 'INTEGRATION_TEST_RESULT', value: integrationTestResult),
+                              string(name: 'STAGING_DEPLOY_RESULT',   value: stagingDeployResult),
+                              string(name: 'PROD_DEPLOY_RESULT',      value: prodDeployResult),
+                              string(name: 'SMOKE_TEST_RESULT',       value: smokeTestResult),
+                              string(name: 'BUILD_URL',               value: env.BUILD_URL)
                           ]
                 }
             }
@@ -320,25 +311,14 @@ pipeline {
 
 // ── HELPER FUNCTIONS ──────────────────────────────────────────────────────────
 
-/** Returns true only when all executed test jobs passed (or were skipped). */
-def allTestsPassed() {
-    def unitOk        = env.UNIT_TEST_RESULT        in ['SUCCESS', 'NOT_RUN']
-    def integrationOk = env.INTEGRATION_TEST_RESULT in ['SUCCESS', 'NOT_RUN']
-    return unitOk && integrationOk
-}
-
-/**
- * Fire-and-forget rollback trigger.
- * @param environment  'staging' or 'production'
- */
 def triggerRollback(String environment) {
     echo "==> Deploy failed on ${environment}. Triggering rollback: ${params.ROLLBACK_JOB}"
     build job: params.ROLLBACK_JOB,
           propagate: false,
           wait: false,
           parameters: [
-              string(name: 'ARTIFACT_ID',  value: env.EFFECTIVE_ARTIFACT_ID),
-              string(name: 'ENVIRONMENT',  value: environment),
+              string(name: 'ARTIFACT_ID',   value: env.EFFECTIVE_ARTIFACT_ID),
+              string(name: 'ENVIRONMENT',   value: environment),
               string(name: 'DEPLOY_REGION', value: params.DEPLOY_REGION)
           ]
 }
